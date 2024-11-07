@@ -514,6 +514,10 @@ CORS_ALLOW_HEADERS = (
     "credentials",
 )
 
+SOURCEFORGE_URL = env(
+    "SOURCEFORGE_URL", default="https://sourceforge.net/projects/boost/files/boost/"
+)
+
 # Legacy Artifactory settings
 # Please note that these settings are not used in the current version of the site,
 # but are kept here for reference.

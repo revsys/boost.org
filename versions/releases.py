@@ -1,3 +1,5 @@
+from dataclasses import asdict, dataclass
+from datetime import datetime
 import json
 from json.decoder import JSONDecodeError
 
@@ -15,6 +17,70 @@ from .models import Version, VersionFile
 
 logger = structlog.get_logger(__name__)
 session = requests.Session()
+
+
+@dataclass
+class SourceForgeFile:
+    commit: str
+    file: str
+    created: str
+    download_link: str
+    sha256: str = ""  # calculated later
+
+    def to_json(self):
+        # Exclude 'download_link' when converting to JSON
+        data_dict = asdict(self)
+        data_dict.pop("download_link", None)
+        return json.dumps(data_dict, indent=4)
+
+
+def download_sourceforge_files_for_release(version: Version) -> list[SourceForgeFile]:
+    file_extensions = [".tar.bz2", ".tar.gz", ".7z", ".zip"]
+
+    commit = version.data["commit"]["sha"]
+    release = version.name.strip("boost-")
+    sf_release_path = f"{settings.SOURCEFORGE_URL}/{release}/"
+
+    try:
+        resp = session.get(sf_release_path)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error(
+            "get_sourceforge_releases_list_error", exc_msg=str(e), url=sf_release_path
+        )
+        raise
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    file_table = soup.find(id="files_list")
+    file_rows = file_table.select("tr.file")
+
+    data = []
+
+    for row in file_rows:
+        file_name = row["title"]
+        if not any(file_name.endswith(ext) for ext in file_extensions):
+            print(f"Skipping file {file_name} due to unsupported extension")
+            continue
+
+        download_link = row.select_one("th a")["href"]
+
+        date_str = row.select_one("td[headers='files_date_h'] abbr")["title"]
+        # Convert date to ISO format
+        created = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S UTC").strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        # Create a FileData instance and append it to the list
+        data.append(
+            SourceForgeFile(
+                commit=commit,
+                file=file_name,
+                created=created,
+                download_link=download_link,
+            )
+        )
+
+    return data
 
 
 def get_archives_download_uris_for_release(release: str = "1.81.0") -> list:
