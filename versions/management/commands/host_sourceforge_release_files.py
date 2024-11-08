@@ -14,8 +14,10 @@ from storages.backends.s3boto3 import S3Boto3Storage
 
 from versions.models import Version
 
+# TODO: change to actual bucket and key used for archives.boost.io and modify
+#   AWS credential settings to match.
 BUCKET_NAME = "stage-rob.boost.org.v2"
-S3_KEY_PREFIX = "test/boost-archives/release"  # TODO: remove `test`
+S3_KEY_PREFIX = "test/boost-archives/release"
 
 session = requests.Session()
 retry_strategy = Retry(
