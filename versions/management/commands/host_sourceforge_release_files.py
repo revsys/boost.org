@@ -2,22 +2,27 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from io import BytesIO
 import json
+from xml.etree import ElementTree
 
 import hashlib
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-from bs4 import BeautifulSoup
 import djclick as click
 from django.conf import settings
 from storages.backends.s3boto3 import S3Boto3Storage
 
 from versions.models import Version
 
-# TODO: change to actual bucket and key used for archives.boost.io and modify
-#   AWS credential settings to match.
+SOURCEFORGE_RSS_URL = "https://sourceforge.net/projects/boost/rss?path=/boost/{release}"
+
+# Note: S3 credentials must be set correctly in your environment / Django settings
+# for the bucket you use below
 BUCKET_NAME = "stage-rob.boost.org.v2"
 S3_KEY_PREFIX = "test/boost-archives/release"
+
+
+LAST_VERSION_NEEDED = "1.62.0"
 
 session = requests.Session()
 retry_strategy = Retry(
@@ -28,12 +33,12 @@ retry_strategy = Retry(
 )
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
-session.mount("http://", adapter)
 
 
 @click.command()
 @click.option("--release", is_flag=False, help="Release name")
-def command(release):
+@click.option("--dry-run", is_flag=True, help="Skip actual import")
+def command(release, dry_run):
     """
     Import release data from SourceForge, and copy the files to S3.
 
@@ -42,16 +47,20 @@ def command(release):
     for all releases included in Artifactory.
     """
     settings.LOCAL_DEVELOPMENT = False  # must turn off to use S3
-    last_release_needed = "1.61.0"
 
     if release:
         versions = Version.objects.filter(name__icontains=release)
     else:
-        versions = Version.objects.filter(name__lte=last_release_needed)
+        versions = Version.objects.filter(
+            name__lte=f"boost-{LAST_VERSION_NEEDED}"
+        ).order_by("-name")
 
-    for v in versions:
+    num_versions = len(versions)
+
+    for idx, v in enumerate(versions, start=1):
         try:
-            print(f"\nGathering download file data for {v}")
+            suffix = f" ({idx}/{num_versions})" if num_versions > 1 else ""
+            print(f"\nGathering download file data for {v}{suffix}")
             sourceforge_file_data = gather_sourceforge_files_for_release(v)
         except requests.exceptions.HTTPError:
             print(f"Skipping {v}, error retrieving file data")
@@ -59,9 +68,12 @@ def command(release):
 
         for file in sourceforge_file_data:
             try:
+                if dry_run:
+                    print(f"Dry run: skipping import of {file.file}")
+                    continue
                 download_and_upload_with_metadata(file)
             except requests.exceptions.HTTPError:
-                print(f"Skipping {file.file}, error retrieving file")
+                print(f"Skipping {file.file}, error downloading file")
                 continue
 
 
@@ -72,13 +84,15 @@ class SourceForgeFile:
     created: str
     download_link: str
     release: str  # e.g. 1.62.0
+    md5: str
     sha256: str = ""  # calculated later
 
     def to_json(self):
-        # Exclude 'download_link' and 'release' when converting to JSON
+        # Exclude `download_link`, `release`, and `md5` when converting to JSON
         data_dict = asdict(self)
         data_dict.pop("download_link")
         data_dict.pop("release")
+        data_dict.pop("md5")
         return json.dumps(data_dict, indent=4)
 
 
@@ -86,33 +100,33 @@ def gather_sourceforge_files_for_release(version: Version) -> list[SourceForgeFi
     file_extensions = [".tar.bz2", ".tar.gz", ".7z", ".zip"]
 
     commit = version.data["commit"]["sha"]
-    release = version.name.strip("boost-")
-    sf_release_path = f"{settings.SOURCEFORGE_URL}/{release}/"
+    release = version.name.lstrip("boost-")
+    rss_url = SOURCEFORGE_RSS_URL.format(release=release)
 
-    resp = session.get(sf_release_path)
+    resp = session.get(rss_url)
     resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    file_table = soup.find(id="files_list")
-    file_rows = file_table.select("tr.file")
+    root = ElementTree.fromstring(resp.content)
+    namespaces = {"media": "http://video.search.yahoo.com/mrss/"}
 
     data = []
 
-    for row in file_rows:
-        file_name = row["title"]
-        if not any(file_name.endswith(ext) for ext in file_extensions):
-            print(f"Skipping file {file_name} due to unsupported extension")
+    for item in root.findall("channel/item"):
+        title = item.find("title").text
+        download_link = item.find("link").text
+        pub_date = item.find("pubDate").text
+
+        if not any(title.endswith(ext) for ext in file_extensions):
             continue
 
-        download_link = row.select_one("th a")["href"]
-
-        date_str = row.select_one("td[headers='files_date_h'] abbr")["title"]
-        # Convert date to ISO format
-        created = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S UTC").strftime(
+        file_name = title.split("/")[-1]  # (e.g., boost_1_60_0.zip)
+        created = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S UT").strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-        # Create a FileData instance and append it to the list
+        media_content = item.find("media:content", namespaces)
+        md5_hash = media_content.find("media:hash", namespaces).text
+
         data.append(
             SourceForgeFile(
                 commit=commit,
@@ -120,6 +134,7 @@ def gather_sourceforge_files_for_release(version: Version) -> list[SourceForgeFi
                 created=created,
                 release=release,
                 download_link=download_link,
+                md5=md5_hash,
             )
         )
 
@@ -133,6 +148,7 @@ def download_and_upload_with_metadata(source_file: SourceForgeFile):
     """
 
     sha256_hash = hashlib.sha256()
+    md5_hash = hashlib.md5()
     storage = S3Boto3Storage(bucket_name=BUCKET_NAME)
 
     print(f"\nDownloading {source_file.file}")
@@ -141,6 +157,16 @@ def download_and_upload_with_metadata(source_file: SourceForgeFile):
 
     # Read the entire file content into memory
     file_content = response.content
+
+    # Validate checksum
+    md5_hash.update(file_content)
+    if md5_hash.hexdigest() != source_file.md5:
+        print("⛔️ File checksum validation failed!")
+        print(f"Expected: {source_file.md5}")
+        print(f"Computed: {md5_hash}")
+        return
+
+    print("✅ Checksum validation passed")
 
     # Calculate SHA256 hash and update the SourceForgeFile instance
     sha256_hash.update(file_content)
@@ -163,6 +189,5 @@ def download_and_upload_with_metadata(source_file: SourceForgeFile):
     print("Uploading metadata json file")
     storage.save(json_s3_key, json_buffer)
 
-    print("\nSHA256 Hash:", source_file.sha256)
-    print(f"File uploaded to S3 with key '{s3_key}'")
-    print(f"Metadata JSON uploaded to S3 with key '{json_s3_key}'")
+    print(f"File uploaded to S3 at key '{s3_key}'")
+    print(f"Metadata JSON uploaded to S3 at key '{json_s3_key}'")
