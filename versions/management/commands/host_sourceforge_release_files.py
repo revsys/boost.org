@@ -18,8 +18,8 @@ SOURCEFORGE_RSS_URL = "https://sourceforge.net/projects/boost/rss?path=/boost/{r
 
 # Note: S3 credentials must be set correctly in your environment / Django settings
 # for the bucket you use below
-BUCKET_NAME = "stage-rob.boost.org.v2"
-S3_KEY_PREFIX = "test/boost-archives/release"
+BUCKET_NAME = "stage-rob.boost.org.v2"  # TODO: change for "production" run
+S3_KEY_PREFIX = "test/boost-archives/release"  # TODO: change for "production" run
 
 
 LAST_VERSION_NEEDED = "1.62.0"
